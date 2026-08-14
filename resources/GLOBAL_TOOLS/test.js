@@ -137,7 +137,7 @@ function validateYearInput(input) {
 async function promptUserToStart() {
     return await window.AndroidBridgePromise.showAlert(
         "上海财经大学浙江学院 · 教务导入",
-        "导入前请确保您已在当前页面成功登录教务系统（CAS 统一身份认证）。\n\n若尚未登录，请先在上方页面完成登录后，再点击下方按钮。",
+        "请先确保已在当前页面成功登录教务系统（CAS 统一身份认证）。\n\n导入时会自动识别页面上当前选中的学年和学期，无需手动选择。",
         "我已登录，开始导入"
     );
 }
@@ -185,11 +185,47 @@ function getStudentIdFromUrl() {
 }
 
 /**
- * 请求并解析课程数据。
- * 依次尝试多个课表数据接口和学期码组合。
+ * 从当前页面自动识别选中的学年(xnm)与学期(xqm)。
+ * 正方教务课表页的学年/学期下拉框通常以 xnm / xqm 命名。
+ * 识别失败返回 null，由调用方回退到手动输入。
  */
-async function fetchAndParseCourses(academicYear, semesterIndex) {
-    const semesterCandidates = getSemesterCodeCandidates(semesterIndex);
+function getCurrentSemesterFromPage() {
+    try {
+        const pairs = [
+            ["#xnm", "#xqm"],
+            ["select[name='xnm']", "select[name='xqm']"],
+            ["#xnmSel", "#xqmSel"],
+            ["select[name='xnm_id']", "select[name='xqm_id']"]
+        ];
+        for (const [yearSel, semSel] of pairs) {
+            const yearEl = document.querySelector(yearSel);
+            const semEl = document.querySelector(semSel);
+            if (yearEl && semEl && yearEl.value !== "" && semEl.value !== "") {
+                return { xnm: String(yearEl.value).trim(), xqm: String(semEl.value).trim() };
+            }
+        }
+        // 兜底：按 name/id 模糊匹配学年学期下拉框
+        let yearEl = null, semEl = null;
+        document.querySelectorAll("select").forEach((s) => {
+            const id = ((s.id || "") + " " + (s.name || "")).toLowerCase();
+            if (!yearEl && /xnm|xnsel|schoolyear|学年/.test(id)) yearEl = s;
+            if (!semEl && /xqm|xqsel|semester|学期/.test(id)) semEl = s;
+        });
+        if (yearEl && semEl && yearEl.value !== "" && semEl.value !== "") {
+            return { xnm: String(yearEl.value).trim(), xqm: String(semEl.value).trim() };
+        }
+    } catch (e) {
+        console.error("JS: 自动识别学年学期失败:", e);
+    }
+    return null;
+}
+
+/**
+ * 请求并解析课程数据。
+ * xnm: 学年（如 2025）；xqmCandidates: 学期码候选列表，依次尝试。
+ */
+async function fetchAndParseCourses(xnm, xqmCandidates) {
+    const semesterCandidates = Array.isArray(xqmCandidates) ? xqmCandidates : [xqmCandidates];
     const studentId = getStudentIdFromUrl();
 
     // 课表数据接口候选（均已通过 HTTP 302->CAS 验证存在）
@@ -211,7 +247,7 @@ async function fetchAndParseCourses(academicYear, semesterIndex) {
     }
 
     for (const semesterCode of semesterCandidates) {
-        const requestBody = `xnm=${academicYear}&xqm=${semesterCode}&kzlx=ck&xsdm=&kclbdm=`;
+        const requestBody = `xnm=${xnm}&xqm=${semesterCode}&kzlx=ck&xsdm=&kclbdm=`;
 
         for (const url of targetUrls) {
             try {
@@ -299,19 +335,35 @@ async function runImportFlow() {
         return;
     }
 
-    const academicYear = await getAcademicYear();
-    if (academicYear === null) {
-        AndroidBridge.showToast("导入已取消。");
-        return;
+    // 自动识别页面当前选中的学年学期；识别失败才回退到手动输入
+    const autoSemester = getCurrentSemesterFromPage();
+    let xnm, xqmCandidates;
+
+    if (autoSemester) {
+        xnm = autoSemester.xnm;
+        // 页面当前值优先，附带对应备选编码（兼容标准编码 3/12 与自定义 1/2）
+        xqmCandidates = [autoSemester.xqm];
+        const alt = { "3": "1", "1": "3", "12": "2", "2": "12" };
+        if (alt[autoSemester.xqm]) xqmCandidates.push(alt[autoSemester.xqm]);
+        AndroidBridge.showToast(`已自动识别学年学期 ${xnm} / ${autoSemester.xqm}，开始获取课表...`);
+        console.log(`JS: 自动识别学年学期 xnm=${xnm}, xqm=${autoSemester.xqm}`);
+    } else {
+        const academicYear = await getAcademicYear();
+        if (academicYear === null) {
+            AndroidBridge.showToast("导入已取消。");
+            return;
+        }
+
+        const semesterIndex = await selectSemester();
+        if (semesterIndex === null || semesterIndex === -1) {
+            AndroidBridge.showToast("导入已取消。");
+            return;
+        }
+        xnm = academicYear;
+        xqmCandidates = getSemesterCodeCandidates(semesterIndex);
     }
 
-    const semesterIndex = await selectSemester();
-    if (semesterIndex === null || semesterIndex === -1) {
-        AndroidBridge.showToast("导入已取消。");
-        return;
-    }
-
-    const result = await fetchAndParseCourses(academicYear, semesterIndex);
+    const result = await fetchAndParseCourses(xnm, xqmCandidates);
     if (result === null) {
         return;
     }
